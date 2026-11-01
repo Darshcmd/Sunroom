@@ -1,0 +1,5 @@
+.aws-sam/
+.venv/
+__pycache__/
+*.py[cod]
+frontend/config.js

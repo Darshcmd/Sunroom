@@ -1,0 +1,5 @@
+window.SUNROOM_CONFIG = {
+  apiUrl: "",
+  region: "",
+  userPoolClientId: ""
+};

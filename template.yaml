@@ -1,0 +1,705 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sunroom photo sharing app using serverless AWS services.
+
+Parameters:
+  MonthlyModerationLimit:
+    Type: Number
+    Default: 350
+    MinValue: 0
+    MaxValue: 350
+    Description: Hard cap for photo upload forms and Rekognition checks in one UTC month. Set to zero to pause uploads.
+  AssetStorageLimitBytes:
+    Type: Number
+    Default: 4294967296
+    MinValue: 6291456
+    MaxValue: 4294967296
+    Description: Hard cap for reserved source and thumbnail storage, 4 GiB maximum.
+  ModerationConfidence:
+    Type: Number
+    Default: 80
+    MinValue: 50
+    MaxValue: 99
+    Description: Minimum Rekognition moderation label confidence that rejects a photo.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref PhotoTable
+        UPLOADS_BUCKET: !Ref UploadsBucket
+        MEDIA_BUCKET: !Ref MediaBucket
+        MAX_UPLOAD_BYTES: '2097152'
+        ASSET_SLOT_BYTES: '6291456'
+        ASSET_STORAGE_LIMIT_BYTES: !Sub '${AssetStorageLimitBytes}'
+        MONTHLY_MODERATION_LIMIT: !Sub '${MonthlyModerationLimit}'
+        MODERATION_CONFIDENCE: !Sub '${ModerationConfidence}'
+        SNS_TOPIC_PREFIX: sunroom-
+
+Resources:
+  PhotoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 3
+      StreamSpecification:
+        StreamViewType: OLD_IMAGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAtEpoch
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: PublicGallery
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - photoId
+              - caption
+              - displayName
+              - createdAt
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 3
+        - IndexName: OwnerGallery
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - photoId
+              - status
+              - caption
+              - displayName
+              - createdAt
+              - moderationReason
+              - reservationBytes
+              - uploadExpiresAt
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 3
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      SSESpecification:
+        SSEEnabled: true
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - PUT
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 600
+      LifecycleConfiguration:
+        Rules:
+          - Id: RemoveStagedOrphanUploads
+            Status: Enabled
+            Prefix: incoming/
+            ExpirationInDays: 1
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-s3-oac
+        Description: Signed access from CloudFront to private Sunroom buckets.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${AWS::StackName}-viewer-limit
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: false
+        CloudWatchMetricsEnabled: false
+        MetricName: !Sub ${AWS::StackName}-viewer-limit
+      Rules:
+        - Name: ViewerRateLimit
+          Priority: 0
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 1200
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: false
+            CloudWatchMetricsEnabled: false
+            MetricName: ViewerRateLimit
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${AWS::StackName} photo gallery
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        WebACLId: !GetAtt SiteWebAcl.Arn
+        Origins:
+          - Id: SiteOrigin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+          - Id: MediaOrigin
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+          - Id: ApiOrigin
+            DomainName: !Sub ${PhotoApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: SiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CacheBehaviors:
+          - PathPattern: /photos
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          - PathPattern: /photos/*
+            TargetOriginId: MediaOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          - PathPattern: /my/*
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /uploads
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${MediaBucket.Arn}/photos/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: OFF
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-web
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      RefreshTokenValidity: 7
+      TokenValidityUnits:
+        RefreshToken: days
+        AccessToken: hours
+        IdToken: hours
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+
+  PhotoApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - authorization
+          - content-type
+        AllowMethods:
+          - GET
+          - POST
+          - DELETE
+          - OPTIONS
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 2
+        ThrottlingRateLimit: 0.08
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              Audience:
+                - !Ref UserPoolClient
+              Issuer: !Sub https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}
+
+  PhotoApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      CodeUri: backend/api/
+      Handler: app.api_handler
+      MemorySize: 128
+      Timeout: 15
+      ReservedConcurrentExecutions: 2
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: WARN
+        SystemLogLevel: WARN
+        LogGroup: !Ref ApiLogGroup
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:TransactWriteItems
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt PhotoTable.Arn
+                - !Sub ${PhotoTable.Arn}/index/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${UploadsBucket.Arn}/incoming/*
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource:
+                - !Sub ${UploadsBucket.Arn}/incoming/*
+                - !Sub ${UploadsBucket.Arn}/originals/*
+                - !Sub ${MediaBucket.Arn}/photos/*
+            - Effect: Allow
+              Action:
+                - sns:CreateTopic
+                - sns:ListSubscriptionsByTopic
+                - sns:Subscribe
+              Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:sunroom-*
+      Events:
+        PublicGallery:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PhotoApi
+            Path: /photos
+            Method: GET
+        MyPhotos:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PhotoApi
+            Path: /my/photos
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        CreatePhoto:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PhotoApi
+            Path: /uploads
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        DeletePhoto:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PhotoApi
+            Path: /my/photos/{photoId}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  WorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-workflow
+      CodeUri: backend/workflow/
+      Handler: app.workflow_handler
+      MemorySize: 1024
+      Timeout: 60
+      ReservedConcurrentExecutions: 2
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: WARN
+        SystemLogLevel: WARN
+        LogGroup: !Ref WorkflowLogGroup
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:TransactWriteItems
+                - dynamodb:UpdateItem
+              Resource: !GetAtt PhotoTable.Arn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub ${UploadsBucket.Arn}/incoming/*
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource:
+                - !Sub ${UploadsBucket.Arn}/incoming/*
+                - !Sub ${UploadsBucket.Arn}/originals/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${UploadsBucket.Arn}/originals/*
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub ${MediaBucket.Arn}/photos/*
+            - Effect: Allow
+              Action: rekognition:DetectModerationLabels
+              Resource: '*'
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:sunroom-*
+
+  StartWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-start-workflow
+      CodeUri: backend/start_workflow/
+      Handler: app.start_workflow_handler
+      MemorySize: 128
+      Timeout: 10
+      ReservedConcurrentExecutions: 2
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: WARN
+        SystemLogLevel: WARN
+        LogGroup: !Ref StartWorkflowLogGroup
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref PhotoWorkflow
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref PhotoWorkflow
+
+  CleanupExpiredUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-cleanup
+      CodeUri: backend/cleanup/
+      Handler: app.cleanup_handler
+      MemorySize: 128
+      Timeout: 15
+      ReservedConcurrentExecutions: 1
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: WARN
+        SystemLogLevel: WARN
+        LogGroup: !Ref CleanupLogGroup
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt PhotoTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+              Resource: !GetAtt PhotoTable.StreamArn
+            - Effect: Allow
+              Action: dynamodb:ListStreams
+              Resource: '*'
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub ${UploadsBucket.Arn}/incoming/*
+      Events:
+        ExpiredPhotoRecords:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt PhotoTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            MaximumRetryAttempts: 5
+            BisectBatchOnFunctionError: true
+
+  PhotoWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub ${AWS::StackName}-photo-processing
+      Type: STANDARD
+      DefinitionUri: statemachine/photo-processing.asl.json
+      DefinitionSubstitutions:
+        WorkflowFunctionArn: !GetAtt WorkflowFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WorkflowFunction
+
+  UploadCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Start photo processing when an upload lands in the private bucket.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref UploadsBucket
+          object:
+            key:
+              - prefix: incoming/
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StartWorkflowFunction.Arn
+          Id: StartPhotoWorkflow
+
+  AllowEventBridgeToStartWorkflow:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartWorkflowFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UploadCreatedRule.Arn
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
+      RetentionInDays: 3
+
+  WorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-workflow
+      RetentionInDays: 3
+
+  StartWorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-start-workflow
+      RetentionInDays: 3
+
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-cleanup
+      RetentionInDays: 3
+
+Outputs:
+  SiteUrl:
+    Description: HTTPS address for the photo gallery.
+    Value: !Sub https://${SiteDistribution.DomainName}
+  ApiUrl:
+    Description: HTTPS API base URL routed through CloudFront.
+    Value: !Sub https://${SiteDistribution.DomainName}
+  SiteBucketName:
+    Description: Private bucket for the static frontend.
+    Value: !Ref SiteBucket
+  UploadsBucketName:
+    Description: Private bucket for staged source images and private originals.
+    Value: !Ref UploadsBucket
+  MediaBucketName:
+    Description: Private bucket for approved thumbnail files.
+    Value: !Ref MediaBucket
+  SiteDistributionId:
+    Description: CloudFront distribution id for frontend uploads and invalidation.
+    Value: !Ref SiteDistribution
+  SiteDistributionArn:
+    Description: CloudFront distribution ARN for the Free pricing plan.
+    Value: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+  SiteWebAclArn:
+    Description: CloudFront WAF web ACL ARN for the Free pricing plan.
+    Value: !GetAtt SiteWebAcl.Arn
+  UserPoolId:
+    Description: Cognito user pool id.
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Public Cognito app client id.
+    Value: !Ref UserPoolClient

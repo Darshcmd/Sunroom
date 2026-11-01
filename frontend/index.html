@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: data: blob:; connect-src 'self' https:; form-action 'self' https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    />
+    <title>Sunroom | A photo wall for everyday life</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/config.js"></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="#top" aria-label="Sunroom home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <circle cx="16" cy="16" r="6.5" fill="currentColor" />
+              <path d="M16 2.75v4M16 25.25v4M2.75 16h4m18.5 0h4M6.65 6.65l2.8 2.8m13.1 13.1 2.8 2.8m0-18.7-2.8 2.8m-13.1 13.1-2.8 2.8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" />
+            </svg>
+          </span>
+          <span>sunroom</span>
+        </a>
+
+        <nav class="primary-nav" aria-label="Main navigation">
+          <button class="nav-link is-active" type="button" data-view="discover" aria-current="page">Photo wall</button>
+          <button class="nav-link" type="button" data-view="mine">My photos</button>
+        </nav>
+
+        <div class="header-actions">
+          <button class="button button-primary button-small" type="button" data-action="upload">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
+            <span>Share a photo</span>
+          </button>
+          <button class="button button-quiet button-small" id="auth-button" type="button" data-action="auth">Sign in</button>
+          <button class="button button-quiet button-small" id="signout-button" type="button" hidden>Sign out</button>
+        </div>
+      </div>
+    </header>
+
+    <main id="top" class="page-shell">
+      <section class="welcome" aria-labelledby="welcome-title">
+        <div class="welcome-copy">
+          <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>A photo wall for everyday life</p>
+          <h1 id="welcome-title">Keep the good moments close.</h1>
+          <p class="welcome-description">A shared place for little trips, long lunches, and the photos you want to see again.</p>
+        </div>
+        <div class="share-note">
+          <div class="note-sun" aria-hidden="true">
+            <svg viewBox="0 0 56 56" fill="none">
+              <circle cx="28" cy="28" r="12" fill="currentColor" />
+              <path d="M28 3v7m0 36v7M3 28h7m36 0h7M10.3 10.3l5 5m25.4 25.4 5 5m0-35.4-5 5M15.3 40.7l-5 5" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+            </svg>
+          </div>
+          <div>
+            <p class="share-note-title">Have one to add?</p>
+            <p class="share-note-copy">Photos are checked before they appear on the wall.</p>
+            <button class="text-button" type="button" data-action="upload">Choose a photo <span aria-hidden="true">↗</span></button>
+          </div>
+        </div>
+      </section>
+
+      <section class="gallery-section" id="discover-view" aria-labelledby="gallery-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow section-eyebrow">From the community</p>
+            <h2 id="gallery-title">The photo wall</h2>
+          </div>
+          <p id="gallery-count" class="quiet-count"></p>
+        </div>
+        <p class="notice" id="gallery-notice" hidden></p>
+        <div id="gallery-content" class="photo-grid" aria-live="polite" aria-busy="true"></div>
+      </section>
+
+      <section class="gallery-section my-photos-section" id="my-photos-view" aria-labelledby="my-photos-title" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow section-eyebrow">Your uploads</p>
+            <h2 id="my-photos-title">My photos</h2>
+          </div>
+          <button class="button button-primary button-small" type="button" data-action="upload">Share a photo</button>
+        </div>
+        <p class="privacy-line">Only approved thumbnail sizes appear on the public wall. Your original stays private.</p>
+        <p class="notice" id="my-photos-notice" hidden></p>
+        <div id="my-photos-content" class="my-photo-list" aria-live="polite" aria-busy="true"></div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <span class="footer-brand"><span class="footer-mark" aria-hidden="true">●</span>sunroom</span>
+        <p>Approved photos are public. Originals and photos waiting for review stay private.</p>
+      </div>
+    </footer>
+
+    <div id="auth-modal" class="modal" hidden>
+      <button class="modal-scrim" type="button" data-close="auth" aria-label="Close sign in"></button>
+      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+        <button class="icon-button dialog-close" type="button" data-close="auth" aria-label="Close">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>
+        </button>
+        <div class="dialog-heading">
+          <span class="dialog-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="5.5"/><path d="M16 2.5v6m0 15v6M2.5 16h6m15 0h6M6.45 6.45l4.25 4.25m10.6 10.6 4.25 4.25m0-19.1-4.25 4.25m-10.6 10.6-4.25 4.25"/></svg></span>
+          <p class="eyebrow">Welcome to Sunroom</p>
+          <h2 id="auth-title">Sign in to share</h2>
+          <p id="auth-intro">Your photos are checked before they join the public wall.</p>
+        </div>
+        <form id="auth-form" class="form-stack">
+          <label id="name-field" hidden>
+            <span>Your name</span>
+            <input id="auth-name" name="name" autocomplete="name" maxlength="48" />
+          </label>
+          <label>
+            <span>Email</span>
+            <input id="auth-email" name="email" type="email" autocomplete="email" required />
+          </label>
+          <label>
+            <span>Password</span>
+            <input id="auth-password" name="password" type="password" autocomplete="current-password" minlength="10" required />
+          </label>
+          <p id="auth-error" class="form-message" role="alert" hidden></p>
+          <button id="auth-submit" class="button button-primary button-full" type="submit">Sign in</button>
+          <p class="auth-switch"><span id="auth-switch-copy">New to Sunroom?</span> <button id="auth-switch" class="text-button" type="button">Create an account</button></p>
+        </form>
+        <form id="confirm-form" class="form-stack" hidden>
+          <p class="confirm-copy">Enter the code from your email. Then sign in to continue.</p>
+          <label>
+            <span>Confirmation code</span>
+            <input id="confirm-code" name="code" inputmode="numeric" autocomplete="one-time-code" required />
+          </label>
+          <p id="confirm-error" class="form-message" role="alert" hidden></p>
+          <button class="button button-primary button-full" type="submit">Confirm email</button>
+          <button id="resend-code" class="text-button resend-button" type="button">Send a new code</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="upload-modal" class="modal" hidden>
+      <button class="modal-scrim" type="button" data-close="upload" aria-label="Close upload"></button>
+      <section class="dialog upload-dialog" role="dialog" aria-modal="true" aria-labelledby="upload-title">
+        <button class="icon-button dialog-close" type="button" data-close="upload" aria-label="Close">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>
+        </button>
+        <div class="dialog-heading upload-heading">
+          <p class="eyebrow">Add to the wall</p>
+          <h2 id="upload-title">Share a good moment.</h2>
+          <p>Choose one JPEG or PNG photo, up to 2 MiB.</p>
+        </div>
+        <form id="upload-form" class="form-stack">
+          <label class="drop-area" for="photo-file" id="drop-area">
+            <span class="drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 32 32" fill="none"><path d="M5 10.5A2.5 2.5 0 0 1 7.5 8h4l2-2.5h5L20.5 8h4A2.5 2.5 0 0 1 27 10.5v13a2.5 2.5 0 0 1-2.5 2.5h-17A2.5 2.5 0 0 1 5 23.5v-13Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="16" cy="17" r="5" stroke="currentColor" stroke-width="1.8"/></svg>
+            </span>
+            <span class="drop-title" id="file-label">Choose a photo</span>
+            <span class="drop-help">JPEG or PNG, 2 MiB max</span>
+            <input id="photo-file" name="photo" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" required />
+          </label>
+          <div id="upload-preview-wrap" class="upload-preview-wrap" hidden>
+            <img id="upload-preview" alt="Selected photo preview" />
+            <div><span id="preview-name"></span><button id="clear-photo" class="text-button" type="button">Change photo</button></div>
+          </div>
+          <label>
+            <span>Caption <span class="optional-label">Optional</span></span>
+            <textarea id="photo-caption" name="caption" maxlength="120" rows="2" placeholder="Add a short note"></textarea>
+          </label>
+          <p class="privacy-note"><strong>Before you share:</strong> approved photos are public, and your name and caption appear with them. Your original stays private.</p>
+          <p id="upload-error" class="form-message" role="alert" hidden></p>
+          <button id="upload-submit" class="button button-primary button-full" type="submit">Share photo</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="viewer-modal" class="modal viewer-modal" hidden>
+      <button class="modal-scrim" type="button" data-close="viewer" aria-label="Close photo"></button>
+      <section class="viewer-dialog" role="dialog" aria-modal="true" aria-label="Photo details">
+        <button class="icon-button viewer-close" type="button" data-close="viewer" aria-label="Close photo">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>
+        </button>
+        <img id="viewer-image" alt="" />
+        <div class="viewer-caption"><div><p id="viewer-title"></p><span id="viewer-owner"></span></div><a id="viewer-download" class="button button-quiet button-small" target="_blank" rel="noreferrer">Open full size</a></div>
+      </section>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

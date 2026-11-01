@@ -1,0 +1,142 @@
+{
+  "Comment": "Check each uploaded image, create thumbnails only after approval, then notify its owner.",
+  "StartAt": "Moderate",
+  "States": {
+    "Moderate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowFunctionArn}",
+        "Payload": {
+          "action": "moderate",
+          "photoId.$": "$.photoId"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "ModerationDecision"
+    },
+    "ModerationDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision",
+          "StringEquals": "SAFE",
+          "Next": "CreateThumbnails"
+        },
+        {
+          "Variable": "$.decision",
+          "StringEquals": "SKIP",
+          "Next": "Done"
+        }
+      ],
+      "Default": "Notify"
+    },
+    "CreateThumbnails": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowFunctionArn}",
+        "Payload": {
+          "action": "create_thumbnails",
+          "photoId.$": "$.photoId"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "MarkApproved"
+    },
+    "MarkApproved": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowFunctionArn}",
+        "Payload": {
+          "action": "mark_approved",
+          "photoId.$": "$.photoId"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "ApprovalDecision"
+    },
+    "ApprovalDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision",
+          "StringEquals": "SKIP",
+          "Next": "Done"
+        }
+      ],
+      "Default": "Notify"
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowFunctionArn}",
+        "Payload": {
+          "action": "mark_failed",
+          "photoId.$": "$.photoId",
+          "error.$": "$.error"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Next": "FailureDecision"
+    },
+    "FailureDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision",
+          "StringEquals": "SKIP",
+          "Next": "Done"
+        }
+      ],
+      "Default": "Notify"
+    },
+    "Notify": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowFunctionArn}",
+        "Payload": {
+          "action": "notify",
+          "photoId.$": "$.photoId",
+          "status.$": "$.status"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.notificationError",
+          "Next": "Done"
+        }
+      ],
+      "Next": "Done"
+    },
+    "Done": {
+      "Type": "Succeed"
+    }
+  }
+}
