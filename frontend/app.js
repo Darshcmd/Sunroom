@@ -48,7 +48,8 @@ const els = {
   viewerImage: document.getElementById("viewer-image"),
   viewerTitle: document.getElementById("viewer-title"),
   viewerOwner: document.getElementById("viewer-owner"),
-  viewerDownload: document.getElementById("viewer-download")
+  viewerDownload: document.getElementById("viewer-download"),
+  viewerSizeStatus: document.getElementById("viewer-size-status")
 };
 
 const state = {
@@ -64,7 +65,10 @@ const state = {
   lastFocused: null,
   toastTimer: 0,
   pollTimer: 0,
-  isUploading: false
+  isUploading: false,
+  pendingViewerPhotoId: "",
+  viewerPhotoId: "",
+  viewerSize: "large"
 };
 
 function escapeHtml(value) {
@@ -257,7 +261,7 @@ function emptyGallery() {
   return `<div class="empty-state">
     <div class="empty-illustration" aria-hidden="true"><span class="empty-sun"></span><span class="empty-frame"><svg viewBox="0 0 32 32"><path d="M4 10.5A2.5 2.5 0 0 1 6.5 8h4l2-2.5h7L22 8h3.5a2.5 2.5 0 0 1 2.5 2.5v13a2.5 2.5 0 0 1-2.5 2.5h-17A2.5 2.5 0 0 1 6 23.5v-13Z"/><circle cx="16" cy="17" r="5"/></svg></span></div>
     <h3>The wall is ready for a first photo.</h3>
-    <p>Share a photo and, once it passes the safety check, it will show up here for everyone.</p>
+    <p>Share a photo and it will show up here after processing.</p>
     <button class="button button-primary button-small" type="button" data-action="upload">Share a photo</button>
   </div>`;
 }
@@ -281,10 +285,8 @@ function statusText(photo) {
   if (photo.status === "UPLOADING" && photo.uploadExpiresAt && Date.parse(photo.uploadExpiresAt) < Date.now()) return "Upload expired";
   return ({
     UPLOADING: "Waiting for upload",
-    PROCESSING: "Checking the photo",
-    APPROVED: "On the public wall",
-    REJECTED: "Not published",
-    QUOTA_PAUSED: "Try again next month",
+    PROCESSING: "Making thumbnails",
+    READY: "On the public wall",
     FAILED: "Could not process",
     DELETING: "Removing"
   })[photo.status] || "Processing";
@@ -304,12 +306,14 @@ function renderMyPhotos() {
   }
   els.myPhotos.innerHTML = photos.map((photo) => {
     const title = photo.caption || "Untitled photo";
-    const image = photo.status === "APPROVED"
+    const image = photo.status === "READY"
       ? `<img class="my-photo-thumb" src="${escapeHtml(mediaUrl(photo.urls.small))}" alt="" loading="lazy" decoding="async" />`
       : '<span class="my-photo-placeholder" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M5 10.5A2.5 2.5 0 0 1 7.5 8h4l2-2.5h5L21.5 8h3A2.5 2.5 0 0 1 27 10.5v13a2.5 2.5 0 0 1-2.5 2.5h-17A2.5 2.5 0 0 1 5 23.5v-13Z"/><circle cx="16" cy="17" r="5"/></svg></span>';
-    const reason = photo.moderationReason ? `<p class="my-photo-reason">${escapeHtml(photo.moderationReason)}</p>` : "";
     const remove = photo.canRemove
       ? `<button class="remove-button" type="button" data-remove-id="${escapeHtml(photo.photoId)}" aria-label="Remove ${escapeHtml(title)}">${photo.status === "DELETING" ? "Retry removal" : "Remove"}</button>`
+      : "";
+    const viewSizes = photo.status === "READY"
+      ? `<button class="text-button" type="button" data-viewer-photo-id="${escapeHtml(photo.photoId)}">View sizes</button>`
       : "";
     const statusClass = `status-${String(photo.status).toLowerCase()}`;
     return `<article class="my-photo-row">
@@ -317,10 +321,10 @@ function renderMyPhotos() {
       <div class="my-photo-main">
         <p class="my-photo-title">${escapeHtml(title)}</p>
         <p class="my-photo-date">Added ${escapeHtml(formatDate(photo.createdAt))}</p>
-        ${reason}
       </div>
       <div class="my-photo-actions">
         <span class="status-label ${statusClass}"><span class="status-dot" aria-hidden="true"></span>${escapeHtml(statusText(photo))}</span>
+        ${viewSizes}
         ${remove}
       </div>
     </article>`;
@@ -344,6 +348,17 @@ async function loadMyPhotos() {
     state.myPhotos = [...recentLocal, ...saved];
     renderMyPhotos();
     updatePolling();
+    const pendingPhoto = state.pendingViewerPhotoId
+      ? state.myPhotos.find((photo) => photo.photoId === state.pendingViewerPhotoId)
+      : null;
+    if (pendingPhoto?.status === "READY") {
+      const photoId = state.pendingViewerPhotoId;
+      state.pendingViewerPhotoId = "";
+      if (state.view === "mine") openViewer(photoId, "large");
+    } else if (pendingPhoto?.status === "FAILED") {
+      state.pendingViewerPhotoId = "";
+      showToast("Your photo uploaded, but thumbnail processing failed. You can remove it from My photos.", true);
+    }
   } catch (error) {
     if (error.message === "Sign in to continue.") clearSession();
     setNotice(els.myNotice, error.message);
@@ -381,8 +396,8 @@ function setAuthMode(mode) {
   const signingUp = mode === "signup";
   els.authTitle.textContent = signingUp ? "Create your account" : "Sign in to share";
   els.authIntro.textContent = signingUp
-    ? "Your name and caption appear with photos approved for the public wall."
-    : "Your photos are checked before they join the public wall.";
+    ? "Your name and caption appear with the photos you share."
+    : "Your photos appear on the public wall after processing.";
   els.authNameField.hidden = !signingUp;
   els.authName.required = signingUp;
   els.authPassword.autocomplete = signingUp ? "new-password" : "current-password";
@@ -550,9 +565,10 @@ async function submitPhoto(event) {
     if (!uploaded.ok) throw new Error("The upload did not finish. Remove this pending photo from My photos and try again.");
 
     closeModal(els.uploadModal);
+    state.pendingViewerPhotoId = result.photo.photoId;
     showToast(result.notificationConfirmationRequested
-      ? "Photo uploaded. Check your email to confirm processing notifications."
-      : "Photo uploaded. It will appear on the wall after the safety check.");
+      ? "Photo uploaded. Check your email to confirm processing notifications. We’ll show its three sizes when they’re ready."
+      : "Photo uploaded. We’ll show its three sizes when they’re ready.");
     await loadMyPhotos();
   } catch (error) {
     setFormError(els.uploadError, error.message);
@@ -575,15 +591,36 @@ function updateViewChrome() {
   });
 }
 
-function openViewer(photoId) {
-  const photo = state.gallery.find((item) => item.photoId === photoId);
+function openViewer(photoId, size = "large") {
+  const photo = state.gallery.find((item) => item.photoId === photoId)
+    || state.myPhotos.find((item) => item.photoId === photoId);
   if (!photo) return;
-  els.viewerImage.src = mediaUrl(photo.urls.large);
-  els.viewerImage.alt = mediaAlt(photo);
+  state.viewerPhotoId = photoId;
   els.viewerTitle.textContent = photo.caption || "A moment from the community";
   els.viewerOwner.textContent = `${photo.displayName || "Member"} · ${formatDate(photo.createdAt)}`;
-  els.viewerDownload.href = mediaUrl(photo.urls.large);
+  setViewerSize(size);
   showModal(els.viewerModal, document.querySelector(".viewer-close"));
+}
+
+function setViewerSize(size) {
+  const labels = { small: "Small", medium: "Medium", large: "Large" };
+  const photo = state.gallery.find((item) => item.photoId === state.viewerPhotoId)
+    || state.myPhotos.find((item) => item.photoId === state.viewerPhotoId);
+  if (!photo?.urls?.[size]) return;
+  state.viewerSize = size;
+  els.viewerImage.src = mediaUrl(photo.urls[size]);
+  els.viewerImage.alt = `${mediaAlt(photo)} · ${labels[size]} thumbnail`;
+  els.viewerDownload.href = mediaUrl(photo.urls[size]);
+  els.viewerDownload.textContent = `Open ${labels[size].toLowerCase()} size`;
+  els.viewerSizeStatus.textContent = `${labels[size]} thumbnail selected`;
+  document.querySelectorAll("[data-viewer-size]").forEach((button) => {
+    const preview = button.querySelector("[data-viewer-preview]");
+    const previewUrl = photo.urls?.[button.dataset.viewerSize];
+    if (preview && previewUrl) preview.src = mediaUrl(previewUrl);
+    const active = button.dataset.viewerSize === size;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
 }
 
 async function removePhoto(photoId, button) {
@@ -627,6 +664,16 @@ document.addEventListener("click", (event) => {
   const photoButton = event.target.closest("[data-photo-id]");
   if (photoButton) {
     openViewer(photoButton.dataset.photoId);
+    return;
+  }
+  const viewerSizeButton = event.target.closest("[data-viewer-size]");
+  if (viewerSizeButton) {
+    setViewerSize(viewerSizeButton.dataset.viewerSize);
+    return;
+  }
+  const viewerPhotoButton = event.target.closest("[data-viewer-photo-id]");
+  if (viewerPhotoButton) {
+    openViewer(viewerPhotoButton.dataset.viewerPhotoId);
     return;
   }
   const removeButton = event.target.closest("[data-remove-id]");

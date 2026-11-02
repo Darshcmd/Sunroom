@@ -85,7 +85,7 @@
           </div>
           <button class="button button-primary button-small" type="button" data-action="upload">Share a photo</button>
         </div>
-        <p class="privacy-line">Only approved thumbnail sizes appear on the public wall. Your original stays private.</p>
+        <p class="privacy-line">Generated thumbnail sizes appear on the public wall. Your original stays private.</p>
         <p class="notice" id="my-photos-notice" hidden></p>
         <div id="my-photos-content" class="my-photo-list" aria-live="polite" aria-busy="true"></div>
       </section>
@@ -94,7 +94,7 @@
     <footer class="site-footer">
       <div class="footer-inner">
         <span class="footer-brand"><span class="footer-mark" aria-hidden="true">●</span>sunroom</span>
-        <p>Approved photos are public. Originals and photos waiting for review stay private.</p>
+        <p>Generated thumbnails are public. Original uploads stay private.</p>
       </div>
     </footer>
 
@@ -108,7 +108,7 @@
           <span class="dialog-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="5.5"/><path d="M16 2.5v6m0 15v6M2.5 16h6m15 0h6M6.45 6.45l4.25 4.25m10.6 10.6 4.25 4.25m0-19.1-4.25 4.25m-10.6 10.6-4.25 4.25"/></svg></span>
           <p class="eyebrow">Welcome to Sunroom</p>
           <h2 id="auth-title">Sign in to share</h2>
-          <p id="auth-intro">Your photos are checked before they join the public wall.</p>
+          <p id="auth-intro">Your photos appear on the public wall after processing.</p>
         </div>
         <form id="auth-form" class="form-stack">
           <label id="name-field" hidden>
@@ -168,7 +168,7 @@
             <span>Caption <span class="optional-label">Optional</span></span>
             <textarea id="photo-caption" name="caption" maxlength="120" rows="2" placeholder="Add a short note"></textarea>
           </label>
-          <p class="privacy-note"><strong>Before you share:</strong> approved photos are public, and your name and caption appear with them. Your original stays private.</p>
+          <p class="privacy-note"><strong>Before you share:</strong> generated thumbnails are public, and your name and caption appear with them. Your original stays private.</p>
           <p id="upload-error" class="form-message" role="alert" hidden></p>
           <button id="upload-submit" class="button button-primary button-full" type="submit">Share photo</button>
         </form>
@@ -182,7 +182,13 @@
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>
         </button>
         <img id="viewer-image" alt="" />
-        <div class="viewer-caption"><div><p id="viewer-title"></p><span id="viewer-owner"></span></div><a id="viewer-download" class="button button-quiet button-small" target="_blank" rel="noreferrer">Open full size</a></div>
+        <div class="viewer-size-controls" role="group" aria-label="Thumbnail size">
+          <button class="viewer-size-button" type="button" data-viewer-size="small" aria-label="Show small thumbnail, up to 360 pixels" aria-pressed="false"><img data-viewer-preview="small" alt="" /><span>Small <small>360px max</small></span></button>
+          <button class="viewer-size-button" type="button" data-viewer-size="medium" aria-label="Show medium thumbnail, up to 960 pixels" aria-pressed="false"><img data-viewer-preview="medium" alt="" /><span>Medium <small>960px max</small></span></button>
+          <button class="viewer-size-button is-active" type="button" data-viewer-size="large" aria-label="Show large thumbnail, up to 1600 pixels" aria-pressed="true"><img data-viewer-preview="large" alt="" /><span>Large <small>1600px max</small></span></button>
+          <span id="viewer-size-status" class="viewer-size-status" aria-live="polite">Large thumbnail</span>
+        </div>
+        <div class="viewer-caption"><div><p id="viewer-title"></p><span id="viewer-owner"></span></div><a id="viewer-download" class="button button-quiet button-small" target="_blank" rel="noreferrer">Open large size</a></div>
       </section>
     </div>
 

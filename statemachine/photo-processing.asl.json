@@ -1,14 +1,14 @@
 {
-  "Comment": "Check each uploaded image, create thumbnails only after approval, then notify its owner.",
-  "StartAt": "Moderate",
+  "Comment": "Create three thumbnail sizes for each upload and notify the owner when processing finishes.",
+  "StartAt": "BeginProcessing",
   "States": {
-    "Moderate": {
+    "BeginProcessing": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${WorkflowFunctionArn}",
         "Payload": {
-          "action": "moderate",
+          "action": "begin_processing",
           "photoId.$": "$.photoId"
         }
       },
@@ -20,23 +20,18 @@
           "Next": "MarkFailed"
         }
       ],
-      "Next": "ModerationDecision"
+      "Next": "BeginDecision"
     },
-    "ModerationDecision": {
+    "BeginDecision": {
       "Type": "Choice",
       "Choices": [
-        {
-          "Variable": "$.decision",
-          "StringEquals": "SAFE",
-          "Next": "CreateThumbnails"
-        },
         {
           "Variable": "$.decision",
           "StringEquals": "SKIP",
           "Next": "Done"
         }
       ],
-      "Default": "Notify"
+      "Default": "CreateThumbnails"
     },
     "CreateThumbnails": {
       "Type": "Task",
@@ -56,15 +51,15 @@
           "Next": "MarkFailed"
         }
       ],
-      "Next": "MarkApproved"
+      "Next": "MarkReady"
     },
-    "MarkApproved": {
+    "MarkReady": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${WorkflowFunctionArn}",
         "Payload": {
-          "action": "mark_approved",
+          "action": "mark_ready",
           "photoId.$": "$.photoId"
         }
       },
@@ -76,9 +71,9 @@
           "Next": "MarkFailed"
         }
       ],
-      "Next": "ApprovalDecision"
+      "Next": "ReadyDecision"
     },
-    "ApprovalDecision": {
+    "ReadyDecision": {
       "Type": "Choice",
       "Choices": [
         {

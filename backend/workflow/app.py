@@ -1,7 +1,7 @@
 import io
 import logging
 import os
-from datetime import datetime, timezone
+from decimal import Decimal
 
 import boto3
 from boto3.dynamodb.types import TypeSerializer
@@ -15,7 +15,6 @@ dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["TABLE_NAME"])
 ddb = dynamodb.meta.client
 s3 = boto3.client("s3")
-rekognition = boto3.client("rekognition")
 sns = boto3.client("sns")
 serializer = TypeSerializer()
 
@@ -23,21 +22,19 @@ TABLE_NAME = os.environ["TABLE_NAME"]
 UPLOADS_BUCKET = os.environ["UPLOADS_BUCKET"]
 MEDIA_BUCKET = os.environ["MEDIA_BUCKET"]
 SLOT_BYTES = int(os.environ["ASSET_SLOT_BYTES"])
-MONTHLY_LIMIT = int(os.environ["MONTHLY_MODERATION_LIMIT"])
 MAX_UPLOAD_BYTES = int(os.environ["MAX_UPLOAD_BYTES"])
-MIN_CONFIDENCE = float(os.environ["MODERATION_CONFIDENCE"])
 ASSET_SIZES = {"small": (360, 360), "medium": (960, 960), "large": (1600, 1600)}
 MAX_THUMBNAILS_BYTES = 4 * 1024 * 1024
 
 
 def workflow_handler(event, _context):
     action = event.get("action")
-    if action == "moderate":
-        return moderate(event["photoId"])
+    if action == "begin_processing":
+        return begin_processing(event["photoId"])
     if action == "create_thumbnails":
         return create_thumbnails(event["photoId"])
-    if action == "mark_approved":
-        return mark_approved(event["photoId"])
+    if action == "mark_ready":
+        return mark_ready(event["photoId"])
     if action == "mark_failed":
         return mark_failed(event["photoId"], event.get("error", {}))
     if action == "notify":
@@ -54,63 +51,50 @@ def low_level(value):
     return {key: serializer.serialize(item) for key, item in value.items()}
 
 
-def update_status_and_release(item, status, reason, expected_statuses=("PROCESSING",)):
+def update_status_and_release(item, status, expected_statuses=("PROCESSING",)):
     reservation = int(item.get("reservationBytes", 0))
-    status_values = {f":expected{index}": {"S": value} for index, value in enumerate(expected_statuses)}
+    status_values = {f":expected{index}": value for index, value in enumerate(expected_statuses)}
     status_condition = " OR ".join(f"#status = :expected{index}" for index in range(len(expected_statuses)))
-    update = {
-        "Update": {
-            "TableName": TABLE_NAME,
-            "Key": {"PK": {"S": "QUOTA#ASSETS"}, "SK": {"S": "META"}},
-            "UpdateExpression": "SET reservedBytes = reservedBytes - :slot",
-            "ConditionExpression": "reservedBytes >= :slot",
-            "ExpressionAttributeValues": {":slot": {"N": str(reservation)}},
-        }
-    }
-    photo_update = {
-        "Update": {
-            "TableName": TABLE_NAME,
-            "Key": {"PK": {"S": item["PK"]}, "SK": {"S": item["SK"]}},
-            "UpdateExpression": "SET #status = :status, moderationReason = :reason, reservationBytes = :zero REMOVE GSI1PK, GSI1SK, expiresAtEpoch",
-            "ConditionExpression": status_condition,
-            "ExpressionAttributeNames": {"#status": "status"},
-            "ExpressionAttributeValues": {
-                ":status": {"S": status},
-                ":reason": {"S": reason},
-                ":zero": {"N": "0"},
-                **status_values,
-            },
-        }
-    }
-
+    quota_key = {"PK": "QUOTA#ASSETS#V4", "SK": "META"}
+    previous_counter = None
     if reservation:
-        ddb.transact_write_items(TransactItems=[update, photo_update])
-    else:
-        ddb.update_item(**photo_update["Update"])
+        quota_item = table.get_item(Key=quota_key, ConsistentRead=True).get("Item", {})
+        previous_counter = quota_item.get("assetBytesReservedV4")
+        if not isinstance(previous_counter, (int, Decimal)) or int(previous_counter) < reservation:
+            raise ValueError("Asset reservation counter is invalid.")
+        previous_counter = int(previous_counter)
+        table.update_item(
+            Key=quota_key,
+            UpdateExpression="SET #counter = :new",
+            ConditionExpression="#counter = :previous",
+            ExpressionAttributeNames={"#counter": "assetBytesReservedV4"},
+            ExpressionAttributeValues={":new": previous_counter - reservation, ":previous": previous_counter},
+        )
+
+    try:
+        table.update_item(
+            Key={"PK": item["PK"], "SK": item["SK"]},
+            UpdateExpression="SET #status = :status, reservationBytes = :zero REMOVE GSI1PK, GSI1SK, expiresAtEpoch",
+            ConditionExpression=status_condition,
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":status": status, ":zero": 0, **status_values},
+        )
+    except ClientError:
+        if reservation:
+            try:
+                table.update_item(
+                    Key=quota_key,
+                    UpdateExpression="SET #counter = :previous",
+                    ConditionExpression="#counter = :current",
+                    ExpressionAttributeNames={"#counter": "assetBytesReservedV4"},
+                    ExpressionAttributeValues={":previous": previous_counter, ":current": previous_counter - reservation},
+                )
+            except ClientError:
+                logger.exception("Could not restore asset reservation after photo status update failed")
+        raise
 
 
-def moderation_count_key():
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
-    return {"PK": f"QUOTA#MODERATION#{month}", "SK": "META"}
-
-
-def reserve_moderation_check():
-    key = moderation_count_key()
-    ddb.update_item(
-        TableName=TABLE_NAME,
-        Key=low_level(key),
-        UpdateExpression="SET #checks = if_not_exists(#checks, :zero) + :one",
-        ConditionExpression="attribute_not_exists(#checks) OR #checks < :limit",
-        ExpressionAttributeNames={"#checks": "checks"},
-        ExpressionAttributeValues={
-            ":zero": {"N": "0"},
-            ":one": {"N": "1"},
-            ":limit": {"N": str(MONTHLY_LIMIT)},
-        },
-    )
-
-
-def moderate(photo_id):
+def begin_processing(photo_id):
     item = get_photo(photo_id)
     if not item or item.get("status") != "UPLOADING":
         return {"photoId": photo_id, "decision": "SKIP"}
@@ -128,34 +112,7 @@ def moderate(photo_id):
             return {"photoId": photo_id, "decision": "SKIP"}
         raise
 
-    try:
-        reserve_moderation_check()
-    except ClientError as error:
-        if error.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
-            raise
-        s3.delete_object(Bucket=UPLOADS_BUCKET, Key=item["uploadKey"])
-        update_status_and_release(
-            {**item, "status": "PROCESSING"},
-            "QUOTA_PAUSED",
-            "This month's automatic safety check limit has been reached.",
-        )
-        return {"photoId": photo_id, "status": "QUOTA_PAUSED"}
-
-    result = rekognition.detect_moderation_labels(
-        Image={"S3Object": {"Bucket": UPLOADS_BUCKET, "Name": item["uploadKey"]}},
-        MinConfidence=MIN_CONFIDENCE,
-    )
-    labels = result.get("ModerationLabels", [])
-    if labels:
-        s3.delete_object(Bucket=UPLOADS_BUCKET, Key=item["uploadKey"])
-        update_status_and_release(
-            {**item, "status": "PROCESSING"},
-            "REJECTED",
-            "This photo did not pass the automatic safety check.",
-        )
-        return {"photoId": photo_id, "status": "REJECTED"}
-
-    return {"photoId": photo_id, "decision": "SAFE"}
+    return {"photoId": photo_id, "decision": "PROCESS"}
 
 
 def render_thumbnails(source_bytes):
@@ -216,7 +173,7 @@ def create_thumbnails(photo_id):
                 Key=key,
                 Body=image_bytes,
                 ContentType="image/jpeg",
-                CacheControl="public, max-age=60",
+                CacheControl="private, max-age=300",
             )
             uploaded.append(key)
 
@@ -226,32 +183,32 @@ def create_thumbnails(photo_id):
         s3.delete_object(Bucket=UPLOADS_BUCKET, Key=final_original)
         raise
 
-    return {"photoId": photo_id, "decision": "SAFE"}
+    return {"photoId": photo_id, "decision": "CREATED"}
 
 
-def mark_approved(photo_id):
+def mark_ready(photo_id):
     item = get_photo(photo_id)
     if not item or item.get("status") != "PROCESSING":
         return {"photoId": photo_id, "status": item.get("status", "MISSING") if item else "MISSING", "decision": "SKIP"}
 
     table.update_item(
         Key={"PK": item["PK"], "SK": item["SK"]},
-        UpdateExpression="SET #status = :approved, GSI1PK = :gallery, GSI1SK = :sort REMOVE moderationReason, expiresAtEpoch",
+        UpdateExpression="SET #status = :ready, GSI1PK = :gallery, GSI1SK = :sort REMOVE expiresAtEpoch",
         ConditionExpression="#status = :processing",
         ExpressionAttributeNames={"#status": "status"},
         ExpressionAttributeValues={
-            ":approved": "APPROVED",
-            ":gallery": "GALLERY#APPROVED",
+            ":ready": "READY",
+            ":gallery": "GALLERY#READY",
             ":sort": f"{item['createdAt']}#{photo_id}",
             ":processing": "PROCESSING",
         },
     )
-    return {"photoId": photo_id, "status": "APPROVED"}
+    return {"photoId": photo_id, "status": "READY"}
 
 
 def mark_failed(photo_id, error):
     item = get_photo(photo_id)
-    if not item or item.get("status") in ("DELETING", "APPROVED", "REJECTED", "QUOTA_PAUSED"):
+    if not item or item.get("status") in ("DELETING", "READY"):
         return {"photoId": photo_id, "status": item.get("status") if item else "MISSING", "decision": "SKIP"}
 
     cleanup_ok = True
@@ -271,25 +228,23 @@ def mark_failed(photo_id, error):
         except Exception:
             cleanup_ok = False
 
-    reason = "This photo could not be processed. Remove it and try again."
     if cleanup_ok:
         try:
-            update_status_and_release({**item, "status": item.get("status", "PROCESSING")}, "FAILED", reason, ("PROCESSING", "UPLOADING"))
+            update_status_and_release(
+                {**item, "status": item.get("status", "PROCESSING")},
+                "FAILED",
+                ("PROCESSING", "UPLOADING"),
+            )
         except ClientError as update_error:
             if update_error.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
     else:
         table.update_item(
             Key={"PK": item["PK"], "SK": item["SK"]},
-            UpdateExpression="SET #status = :failed, moderationReason = :reason REMOVE GSI1PK, GSI1SK, expiresAtEpoch",
+            UpdateExpression="SET #status = :failed REMOVE GSI1PK, GSI1SK, expiresAtEpoch",
             ConditionExpression="#status = :processing OR #status = :uploading",
             ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={
-                ":failed": "FAILED",
-                ":reason": reason,
-                ":processing": "PROCESSING",
-                ":uploading": "UPLOADING",
-            },
+            ExpressionAttributeValues={":failed": "FAILED", ":processing": "PROCESSING", ":uploading": "UPLOADING"},
         )
 
     logger.warning("Photo processing failed for %s: %s", photo_id, error.get("Error", "unknown"))
@@ -302,12 +257,8 @@ def notify(photo_id, status):
         return {"photoId": photo_id, "notified": False}
 
     title = item.get("caption") or "Your photo"
-    if status == "APPROVED":
-        message = f"{title} passed the safety check and is now in the public gallery. Open Sunroom to see it on the photo wall."
-    elif status == "REJECTED":
-        message = f"{title} did not pass the automatic safety check. It was not published."
-    elif status == "QUOTA_PAUSED":
-        message = "Your photo was not published because this month's automatic safety-check limit has been reached. Try again next month."
+    if status == "READY":
+        message = f"{title} has finished processing and is now in the public gallery. Open Sunroom to see it on the photo wall."
     else:
         message = f"{title} could not be processed. Remove it from My photos and try again."
 

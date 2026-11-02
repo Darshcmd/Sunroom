@@ -3,25 +3,18 @@ Transform: AWS::Serverless-2016-10-31
 Description: Sunroom photo sharing app using serverless AWS services.
 
 Parameters:
-  MonthlyModerationLimit:
+  MonthlyPhotoLimit:
     Type: Number
     Default: 350
     MinValue: 0
     MaxValue: 350
-    Description: Hard cap for photo upload forms and Rekognition checks in one UTC month. Set to zero to pause uploads.
+    Description: Hard cap on photo uploads in one UTC month. Set to zero to pause uploads.
   AssetStorageLimitBytes:
     Type: Number
     Default: 4294967296
     MinValue: 6291456
     MaxValue: 4294967296
     Description: Hard cap for reserved source and thumbnail storage, 4 GiB maximum.
-  ModerationConfidence:
-    Type: Number
-    Default: 80
-    MinValue: 50
-    MaxValue: 99
-    Description: Minimum Rekognition moderation label confidence that rejects a photo.
-
 Globals:
   Function:
     Runtime: python3.12
@@ -32,11 +25,11 @@ Globals:
         TABLE_NAME: !Ref PhotoTable
         UPLOADS_BUCKET: !Ref UploadsBucket
         MEDIA_BUCKET: !Ref MediaBucket
+        SITE_BUCKET: !Ref SiteBucket
         MAX_UPLOAD_BYTES: '2097152'
         ASSET_SLOT_BYTES: '6291456'
         ASSET_STORAGE_LIMIT_BYTES: !Sub '${AssetStorageLimitBytes}'
-        MONTHLY_MODERATION_LIMIT: !Sub '${MonthlyModerationLimit}'
-        MODERATION_CONFIDENCE: !Sub '${ModerationConfidence}'
+        MONTHLY_UPLOAD_LIMIT: !Sub '${MonthlyPhotoLimit}'
         SNS_TOPIC_PREFIX: sunroom-
 
 Resources:
@@ -101,7 +94,6 @@ Resources:
               - caption
               - displayName
               - createdAt
-              - moderationReason
               - reservationBytes
               - uploadExpiresAt
           ProvisionedThroughput:
@@ -177,176 +169,6 @@ Resources:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
 
-  SiteOriginAccessControl:
-    Type: AWS::CloudFront::OriginAccessControl
-    Properties:
-      OriginAccessControlConfig:
-        Name: !Sub ${AWS::StackName}-s3-oac
-        Description: Signed access from CloudFront to private Sunroom buckets.
-        OriginAccessControlOriginType: s3
-        SigningBehavior: always
-        SigningProtocol: sigv4
-
-  SiteWebAcl:
-    Type: AWS::WAFv2::WebACL
-    Properties:
-      Name: !Sub ${AWS::StackName}-viewer-limit
-      Scope: CLOUDFRONT
-      DefaultAction:
-        Allow: {}
-      VisibilityConfig:
-        SampledRequestsEnabled: false
-        CloudWatchMetricsEnabled: false
-        MetricName: !Sub ${AWS::StackName}-viewer-limit
-      Rules:
-        - Name: ViewerRateLimit
-          Priority: 0
-          Action:
-            Block: {}
-          Statement:
-            RateBasedStatement:
-              Limit: 1200
-              EvaluationWindowSec: 300
-              AggregateKeyType: IP
-          VisibilityConfig:
-            SampledRequestsEnabled: false
-            CloudWatchMetricsEnabled: false
-            MetricName: ViewerRateLimit
-
-  SiteDistribution:
-    Type: AWS::CloudFront::Distribution
-    Properties:
-      DistributionConfig:
-        Enabled: true
-        Comment: !Sub ${AWS::StackName} photo gallery
-        DefaultRootObject: index.html
-        HttpVersion: http2and3
-        PriceClass: PriceClass_100
-        WebACLId: !GetAtt SiteWebAcl.Arn
-        Origins:
-          - Id: SiteOrigin
-            DomainName: !GetAtt SiteBucket.RegionalDomainName
-            S3OriginConfig:
-              OriginAccessIdentity: ''
-            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
-          - Id: MediaOrigin
-            DomainName: !GetAtt MediaBucket.RegionalDomainName
-            S3OriginConfig:
-              OriginAccessIdentity: ''
-            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
-          - Id: ApiOrigin
-            DomainName: !Sub ${PhotoApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
-            CustomOriginConfig:
-              OriginProtocolPolicy: https-only
-              OriginSSLProtocols:
-                - TLSv1.2
-        DefaultCacheBehavior:
-          TargetOriginId: SiteOrigin
-          ViewerProtocolPolicy: redirect-to-https
-          AllowedMethods:
-            - GET
-            - HEAD
-          CachedMethods:
-            - GET
-            - HEAD
-          Compress: true
-          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
-        CacheBehaviors:
-          - PathPattern: /photos
-            TargetOriginId: ApiOrigin
-            ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods:
-              - GET
-              - HEAD
-              - OPTIONS
-            CachedMethods:
-              - GET
-              - HEAD
-            Compress: true
-            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
-          - PathPattern: /photos/*
-            TargetOriginId: MediaOrigin
-            ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods:
-              - GET
-              - HEAD
-            CachedMethods:
-              - GET
-              - HEAD
-            Compress: true
-            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
-          - PathPattern: /my/*
-            TargetOriginId: ApiOrigin
-            ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods:
-              - GET
-              - HEAD
-              - OPTIONS
-              - PUT
-              - PATCH
-              - POST
-              - DELETE
-            CachedMethods:
-              - GET
-              - HEAD
-            Compress: true
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
-          - PathPattern: /uploads
-            TargetOriginId: ApiOrigin
-            ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods:
-              - GET
-              - HEAD
-              - OPTIONS
-              - PUT
-              - PATCH
-              - POST
-              - DELETE
-            CachedMethods:
-              - GET
-              - HEAD
-            Compress: true
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
-        ViewerCertificate:
-          CloudFrontDefaultCertificate: true
-        Restrictions:
-          GeoRestriction:
-            RestrictionType: none
-
-  SiteBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref SiteBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: cloudfront.amazonaws.com
-            Action: s3:GetObject
-            Resource: !Sub ${SiteBucket.Arn}/*
-            Condition:
-              StringEquals:
-                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
-
-  MediaBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref MediaBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: cloudfront.amazonaws.com
-            Action: s3:GetObject
-            Resource: !Sub ${MediaBucket.Arn}/photos/*
-            Condition:
-              StringEquals:
-                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
-
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -355,7 +177,7 @@ Resources:
         - email
       AutoVerifiedAttributes:
         - email
-      MfaConfiguration: OFF
+      MfaConfiguration: 'OFF'
       Policies:
         PasswordPolicy:
           MinimumLength: 10
@@ -410,8 +232,8 @@ Resources:
           - OPTIONS
         MaxAge: 600
       DefaultRouteSettings:
-        ThrottlingBurstLimit: 2
-        ThrottlingRateLimit: 0.08
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 2
       Auth:
         Authorizers:
           CognitoAuthorizer:
@@ -429,7 +251,6 @@ Resources:
       Handler: app.api_handler
       MemorySize: 128
       Timeout: 15
-      ReservedConcurrentExecutions: 2
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: WARN
@@ -441,15 +262,22 @@ Resources:
             - Effect: Allow
               Action:
                 - dynamodb:GetItem
+                - dynamodb:PutItem
                 - dynamodb:Query
                 - dynamodb:TransactWriteItems
                 - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
               Resource:
                 - !GetAtt PhotoTable.Arn
                 - !Sub ${PhotoTable.Arn}/index/*
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub ${UploadsBucket.Arn}/incoming/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub ${SiteBucket.Arn}/*
+                - !Sub ${MediaBucket.Arn}/photos/*
             - Effect: Allow
               Action: s3:DeleteObject
               Resource:
@@ -463,6 +291,18 @@ Resources:
                 - sns:Subscribe
               Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:sunroom-*
       Events:
+        SiteRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PhotoApi
+            Path: /
+            Method: GET
+        SiteAssets:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PhotoApi
+            Path: /{proxy+}
+            Method: GET
         PublicGallery:
           Type: HttpApi
           Properties:
@@ -502,7 +342,6 @@ Resources:
       Handler: app.workflow_handler
       MemorySize: 1024
       Timeout: 60
-      ReservedConcurrentExecutions: 2
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: WARN
@@ -534,9 +373,6 @@ Resources:
                 - s3:DeleteObject
               Resource: !Sub ${MediaBucket.Arn}/photos/*
             - Effect: Allow
-              Action: rekognition:DetectModerationLabels
-              Resource: '*'
-            - Effect: Allow
               Action: sns:Publish
               Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:sunroom-*
 
@@ -548,7 +384,6 @@ Resources:
       Handler: app.start_workflow_handler
       MemorySize: 128
       Timeout: 10
-      ReservedConcurrentExecutions: 2
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: WARN
@@ -571,7 +406,6 @@ Resources:
       Handler: app.cleanup_handler
       MemorySize: 128
       Timeout: 15
-      ReservedConcurrentExecutions: 1
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: WARN
@@ -583,6 +417,7 @@ Resources:
             - Effect: Allow
               Action:
                 - dynamodb:GetItem
+                - dynamodb:PutItem
                 - dynamodb:TransactWriteItems
               Resource: !GetAtt PhotoTable.Arn
             - Effect: Allow
@@ -674,11 +509,11 @@ Resources:
 
 Outputs:
   SiteUrl:
-    Description: HTTPS address for the photo gallery.
-    Value: !Sub https://${SiteDistribution.DomainName}
+    Description: HTTPS address for the Sunroom website and API.
+    Value: !Sub https://${PhotoApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
   ApiUrl:
-    Description: HTTPS API base URL routed through CloudFront.
-    Value: !Sub https://${SiteDistribution.DomainName}
+    Description: HTTPS API base URL.
+    Value: !Sub https://${PhotoApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
   SiteBucketName:
     Description: Private bucket for the static frontend.
     Value: !Ref SiteBucket
@@ -686,17 +521,8 @@ Outputs:
     Description: Private bucket for staged source images and private originals.
     Value: !Ref UploadsBucket
   MediaBucketName:
-    Description: Private bucket for approved thumbnail files.
+    Description: Private bucket for generated thumbnail files.
     Value: !Ref MediaBucket
-  SiteDistributionId:
-    Description: CloudFront distribution id for frontend uploads and invalidation.
-    Value: !Ref SiteDistribution
-  SiteDistributionArn:
-    Description: CloudFront distribution ARN for the Free pricing plan.
-    Value: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
-  SiteWebAclArn:
-    Description: CloudFront WAF web ACL ARN for the Free pricing plan.
-    Value: !GetAtt SiteWebAcl.Arn
   UserPoolId:
     Description: Cognito user pool id.
     Value: !Ref UserPool

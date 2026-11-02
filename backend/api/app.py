@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import logging
@@ -5,12 +6,14 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from decimal import Decimal
 
 import boto3
-from boto3.dynamodb.types import TypeSerializer
+from botocore.config import Config
 from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
+from urllib.parse import unquote
 
 
 logger = logging.getLogger()
@@ -18,22 +21,23 @@ logger.setLevel(logging.WARNING)
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["TABLE_NAME"])
 ddb = dynamodb.meta.client
-s3 = boto3.client("s3")
+s3 = boto3.client("s3", config=Config(signature_version="s3v4"))
 sns = boto3.client("sns")
 serializer = TypeSerializer()
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 UPLOADS_BUCKET = os.environ["UPLOADS_BUCKET"]
 MEDIA_BUCKET = os.environ["MEDIA_BUCKET"]
+SITE_BUCKET = os.environ["SITE_BUCKET"]
 MAX_UPLOAD_BYTES = int(os.environ["MAX_UPLOAD_BYTES"])
 ASSET_SLOT_BYTES = int(os.environ["ASSET_SLOT_BYTES"])
 ASSET_STORAGE_LIMIT_BYTES = int(os.environ["ASSET_STORAGE_LIMIT_BYTES"])
-MONTHLY_LIMIT = int(os.environ["MONTHLY_MODERATION_LIMIT"])
+MONTHLY_LIMIT = int(os.environ["MONTHLY_UPLOAD_LIMIT"])
 SNS_TOPIC_PREFIX = os.environ["SNS_TOPIC_PREFIX"]
 PUBLIC_INDEX = "PublicGallery"
 OWNER_INDEX = "OwnerGallery"
 ALLOWED_TYPES = {"image/jpeg": "jpg", "image/png": "png"}
-REMOVABLE_STATUSES = {"UPLOADING", "APPROVED", "REJECTED", "QUOTA_PAUSED", "FAILED", "DELETING"}
+REMOVABLE_STATUSES = {"UPLOADING", "READY", "FAILED", "DELETING"}
 
 
 def api_handler(event, _context):
@@ -56,6 +60,8 @@ def api_handler(event, _context):
             owner_id = require_owner(claims)
             photo_id = path.rsplit("/", 1)[-1]
             return delete_photo(owner_id, photo_id)
+        if method == "GET":
+            return get_site_asset(path)
         return response(404, {"message": "That page is not here."})
     except ValueError as error:
         return response(400, {"message": str(error)})
@@ -93,14 +99,42 @@ def clean_text(value, limit):
 
 
 def photo_urls(photo_id):
-    base = f"/photos/{quote(photo_id, safe='')}"
-    return {size: f"{base}/{size}.jpg" for size in ("small", "medium", "large")}
+    return {
+        size: s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": MEDIA_BUCKET, "Key": f"photos/{photo_id}/{size}.jpg"},
+            ExpiresIn=21600,
+        )
+        for size in ("small", "medium", "large")
+    }
+
+
+def get_site_asset(path):
+    key = unquote(path).lstrip("/") or "index.html"
+    if ".." in key.split("/"):
+        return response(404, {"message": "That page is not here."})
+    try:
+        asset = s3.get_object(Bucket=SITE_BUCKET, Key=key)
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") in ("NoSuchKey", "NoSuchBucket", "404"):
+            return response(404, {"message": "That page is not here."})
+        raise
+    body = asset["Body"].read()
+    return {
+        "statusCode": 200,
+        "headers": {
+            "content-type": asset.get("ContentType", "application/octet-stream"),
+            "cache-control": asset.get("CacheControl", "public, max-age=300"),
+        },
+        "isBase64Encoded": True,
+        "body": base64.b64encode(body).decode("ascii"),
+    }
 
 
 def list_public_photos():
     result = table.query(
         IndexName=PUBLIC_INDEX,
-        KeyConditionExpression=Key("GSI1PK").eq("GALLERY#APPROVED"),
+        KeyConditionExpression=Key("GSI1PK").eq("GALLERY#READY"),
         Limit=700,
         ScanIndexForward=False,
         ProjectionExpression="photoId, caption, displayName, createdAt",
@@ -123,7 +157,7 @@ def list_owner_photos(owner_id):
         KeyConditionExpression=Key("GSI2PK").eq(f"USER#{owner_id}"),
         Limit=1000,
         ScanIndexForward=False,
-        ProjectionExpression="photoId, #status, caption, displayName, createdAt, uploadExpiresAt, moderationReason, reservationBytes",
+        ProjectionExpression="photoId, #status, caption, displayName, createdAt, uploadExpiresAt, reservationBytes",
         ExpressionAttributeNames={"#status": "status"},
     )
     photos = []
@@ -135,10 +169,9 @@ def list_owner_photos(owner_id):
             "displayName": item.get("displayName", "Member"),
             "createdAt": item["createdAt"],
             "uploadExpiresAt": item.get("uploadExpiresAt", ""),
-            "moderationReason": item.get("moderationReason", ""),
             "canRemove": item["status"] in REMOVABLE_STATUSES,
         }
-        if item["status"] == "APPROVED":
+        if item["status"] == "READY":
             photo["urls"] = photo_urls(item["photoId"])
         photos.append(photo)
     return photos
@@ -150,7 +183,65 @@ def marshal(item):
 
 def monthly_upload_quota_key(now):
     month = now.strftime("%Y-%m")
-    return {"PK": f"QUOTA#UPLOADS#{month}", "SK": "META"}
+    return {"PK": f"QUOTA#UPLOADS#V2#{month}", "SK": "META"}
+
+
+def update_quota_counter(key, attribute, amount, limit):
+    item = table.get_item(Key=key, ConsistentRead=True).get("Item", {})
+    current_value = item.get(attribute)
+    values = {":new": 0}
+
+    if isinstance(current_value, (int, Decimal)) and not isinstance(current_value, bool):
+        current = int(current_value)
+        condition = "#counter = :current"
+        values[":current"] = current
+    elif current_value is None:
+        current = 0
+        condition = "attribute_not_exists(#counter)"
+    else:
+        current = 0
+        stored_type = next(iter(serializer.serialize(current_value)))
+        condition = "attribute_type(#counter, :stored_type)"
+        values[":stored_type"] = stored_type
+
+    next_value = current + amount
+    if next_value < 0 or next_value > limit:
+        return None
+    values[":new"] = next_value
+    try:
+        table.update_item(
+            Key=key,
+            UpdateExpression="SET #counter = :new",
+            ConditionExpression=condition,
+            ExpressionAttributeNames={"#counter": attribute},
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return None
+        raise
+    return {"key": key, "attribute": attribute, "previous": current_value, "written": next_value}
+
+
+def rollback_quota_counter(reservation):
+    if not reservation:
+        return
+    values = {":written": reservation["written"]}
+    if reservation["previous"] is None:
+        update = "REMOVE #counter"
+    else:
+        update = "SET #counter = :previous"
+        values[":previous"] = reservation["previous"]
+    try:
+        table.update_item(
+            Key=reservation["key"],
+            UpdateExpression=update,
+            ConditionExpression="#counter = :written",
+            ExpressionAttributeNames={"#counter": reservation["attribute"]},
+            ExpressionAttributeValues=values,
+        )
+    except ClientError:
+        logger.exception("Could not roll back quota reservation for %s", reservation["key"]["PK"])
 
 
 def ensure_user_topic(owner_id, email):
@@ -193,7 +284,7 @@ def create_upload(event, owner_id, claims):
     if not email or "@" not in email:
         raise ValueError("Add a verified email address to your account before uploading.")
     if MONTHLY_LIMIT == 0:
-        return response(503, {"message": "Uploads are paused while the automatic safety check limit is set to zero."})
+        return response(503, {"message": "Photo uploads are paused for this month."})
 
     topic_arn, confirmation_requested = ensure_user_topic(owner_id, email)
     photo_id = str(uuid.uuid4())
@@ -249,48 +340,32 @@ def create_upload(event, owner_id, claims):
     }
 
     try:
-        ddb.transact_write_items(TransactItems=[
-            {
-                "Update": {
-                    "TableName": TABLE_NAME,
-                    "Key": {"PK": {"S": "QUOTA#ASSETS"}, "SK": {"S": "META"}},
-                    "UpdateExpression": "SET reservedBytes = if_not_exists(reservedBytes, :zero) + :slot",
-                    "ConditionExpression": "attribute_not_exists(reservedBytes) OR reservedBytes <= :max",
-                    "ExpressionAttributeValues": {
-                        ":zero": {"N": "0"},
-                        ":slot": {"N": str(ASSET_SLOT_BYTES)},
-                        ":max": {"N": str(ASSET_STORAGE_LIMIT_BYTES - ASSET_SLOT_BYTES)},
-                    },
-                }
-            },
-            {
-                "Update": {
-                    "TableName": TABLE_NAME,
-                    "Key": marshal(monthly_upload_quota_key(now)),
-                    "UpdateExpression": "SET #uploads = if_not_exists(#uploads, :zero) + :one",
-                    "ConditionExpression": "attribute_not_exists(#uploads) OR #uploads < :limit",
-                    "ExpressionAttributeNames": {"#uploads": "uploads"},
-                    "ExpressionAttributeValues": {
-                        ":zero": {"N": "0"},
-                        ":one": {"N": "1"},
-                        ":limit": {"N": str(MONTHLY_LIMIT)},
-                    },
-                }
-            },
-            {
-                "Put": {
-                    "TableName": TABLE_NAME,
-                    "Item": marshal(photo),
-                    "ConditionExpression": "attribute_not_exists(PK)",
-                }
-            },
-        ])
-    except ClientError as error:
-        if error.response.get("Error", {}).get("Code") == "TransactionCanceledException":
-            reasons = error.response.get("CancellationReasons", [])
-            if len(reasons) > 1 and reasons[1].get("Code") == "ConditionalCheckFailed":
-                return response(429, {"message": "This month's free photo limit has been reached. Try again next month."})
+        asset_reservation = update_quota_counter(
+            {"PK": "QUOTA#ASSETS#V4", "SK": "META"},
+            "assetBytesReservedV4",
+            ASSET_SLOT_BYTES,
+            ASSET_STORAGE_LIMIT_BYTES,
+        )
+        if not asset_reservation:
             return response(409, {"message": "The photo wall has reached its storage limit. Remove a photo and try again."})
+
+        monthly_reservation = update_quota_counter(
+            monthly_upload_quota_key(now),
+            "uploadCountV3",
+            1,
+            MONTHLY_LIMIT,
+        )
+        if not monthly_reservation:
+            rollback_quota_counter(asset_reservation)
+            return response(429, {"message": "This month's free photo limit has been reached. Try again next month."})
+
+        try:
+            table.put_item(Item=photo, ConditionExpression="attribute_not_exists(PK)")
+        except ClientError:
+            rollback_quota_counter(monthly_reservation)
+            rollback_quota_counter(asset_reservation)
+            raise
+    except ClientError as error:
         raise
 
     return response(201, {
@@ -314,7 +389,7 @@ def delete_photo(owner_id, photo_id):
     if not item or item.get("ownerId") != owner_id:
         return response(404, {"message": "That photo could not be found."})
     if item.get("status") not in REMOVABLE_STATUSES:
-        return response(409, {"message": "Wait for the safety check to finish before removing this photo."})
+        return response(409, {"message": "Wait for photo processing to finish before removing this photo."})
 
     table.update_item(
         Key={"PK": item["PK"], "SK": item["SK"]},
@@ -333,27 +408,26 @@ def delete_photo(owner_id, photo_id):
         return response(503, {"message": "Removal could not finish. Choose Remove again to retry."})
 
     reservation = int(item.get("reservationBytes", 0))
-    transaction = []
+    quota_change = None
     if reservation:
-        transaction.append({
-            "Update": {
-                "TableName": TABLE_NAME,
-                "Key": {"PK": {"S": "QUOTA#ASSETS"}, "SK": {"S": "META"}},
-                "UpdateExpression": "SET reservedBytes = reservedBytes - :slot",
-                "ConditionExpression": "reservedBytes >= :slot",
-                "ExpressionAttributeValues": {":slot": {"N": str(reservation)}},
-            }
-        })
-    transaction.append({
-        "Delete": {
-            "TableName": TABLE_NAME,
-            "Key": {"PK": {"S": item["PK"]}, "SK": {"S": item["SK"]}},
-            "ConditionExpression": "ownerId = :owner AND #status = :deleting",
-            "ExpressionAttributeNames": {"#status": "status"},
-            "ExpressionAttributeValues": {":owner": {"S": owner_id}, ":deleting": {"S": "DELETING"}},
-        }
-    })
-    ddb.transact_write_items(TransactItems=transaction)
+        quota_change = update_quota_counter(
+            {"PK": "QUOTA#ASSETS#V4", "SK": "META"},
+            "assetBytesReservedV4",
+            -reservation,
+            ASSET_STORAGE_LIMIT_BYTES,
+        )
+        if not quota_change:
+            return response(409, {"message": "The photo storage reservation could not be released. Retry removal."})
+    try:
+        table.delete_item(
+            Key={"PK": item["PK"], "SK": item["SK"]},
+            ConditionExpression="ownerId = :owner AND #status = :deleting",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":owner": owner_id, ":deleting": "DELETING"},
+        )
+    except ClientError:
+        rollback_quota_counter(quota_change)
+        raise
     return {"statusCode": 204, "headers": {"cache-control": "no-store"}, "body": ""}
 
 
